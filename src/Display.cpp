@@ -49,7 +49,7 @@ const char WIFI_PASSWORD[] PROGMEM = "password";
 const char HTTPSTRING[] PROGMEM = "http://";
 const char APIDATA[] PROGMEM = "/solar_api/GetAPIVersion.cgi";
 const char INVERTERDATA[] PROGMEM = "/solar_api/v1/GetPowerFlowRealtimeData.fcgi";
-const char INVERTERVOLTAGE[] PROGMEM = "/solar_api/v1/GetInverterRealtimeData.cgi?Scope=Device&DataCollection=3PInverterData";
+const char INVERTERVOLTAGE[] PROGMEM = "/solar_api/v1/GetMeterRealtimeData.cgi?Scope=System";
 
 char IP_char[16] = "0";
 char MAC_char[32] = "0";
@@ -417,15 +417,15 @@ gridVoltage getGridVoltage() {
     DEBUG_PRINTLN(error.f_str());
     return gV;
   }
-  if (doc["Body"]["Data"]["UAC_L1"]["Value"] == nullptr) {
-    DEBUG_PRINTLN(F("Inverter data not available"));
+  if (doc["Body"]["Data"]["0"]["Voltage_AC_Phase_1"] == nullptr) {
+    DEBUG_PRINTLN(F("Meter data not available"));
     connectErrors++;
     return gV;
   }
   // Extract values
-  float UAC_L1 = doc["Body"]["Data"]["UAC_L1"]["Value"].as<float>();
-  float UAC_L2 = doc["Body"]["Data"]["UAC_L2"]["Value"].as<float>();
-  float UAC_L3 = doc["Body"]["Data"]["UAC_L3"]["Value"].as<float>();
+  float UAC_L1 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_1"].as<float>();
+  float UAC_L2 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_2"].as<float>();
+  float UAC_L3 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_3"].as<float>();
   gV.L1 = UAC_L1;
   gV.L2 = UAC_L2;
   gV.L3 = UAC_L3;
@@ -715,7 +715,6 @@ void loop() {
   //Main function that displays PV data
   if (initSuccess && (millis() - timeout) > 5000) {
     PowerData prm = getInverterData();
-    gridVoltage gv = getGridVoltage();
 
     lcd.clear();
     //PV Production
@@ -781,6 +780,7 @@ void loop() {
     } else {
       lcd.print(strcat(buffer, gridArrows));
     }
+    gridVoltage gv = getGridVoltage();
     lcd.setCursor(2,3);
     lcd.print(gv.devPercent); lcd.print(F("%gV ")); lcd.print(connectErrors); lcd.print(F("E ")); lcd.print(WiFi.RSSI()); lcd.print(F("RSSI"));
 

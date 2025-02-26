@@ -78,7 +78,7 @@ After flashing the ESP32 will open up a WiFi Access point "SOLAR_POWER_DISPLAY".
 
 1. Power on the ESP32 module.
 2. The device will attempt to connect to the last known WiFi network. If it fails, it will start the WiFiManager configuration portal.
-3. After flashing the ESP32 will open up a WiFi Access point "SOLAR_POWER_DISPLAY". Connect to it and navigate to the website at 192.168.4.1. Connect to the WiFiManager configuration portal and configure FIRST the inverter IP address, THEN the WiFi network to connect to.
+3. After flashing the ESP32 will open up a WiFi Access point "SOLAR_POWER_DISPLAY". Connect to it and navigate to the website at 192.168.4.1. Connect to the WiFiManager configuration portal and configure FIRST the inverter IP address under the SETUP menu, THEN the WiFi network to connect to.
 4. The device will display the PV production, grid consumption, and home consumption data on the LCD.
 
 If later on you want to re-connect to the WiFi-Manager configuration portal just press the BOOT switch on your ESP32 devboad. If you press the switch for 3+ secs it will erase all previously stored configuration data.
