@@ -1,0 +1,8 @@
+.pio
+.vscode
+esp-idf
+include
+lib/ArduinoJson
+lib/LiquidCrystal-master
+test
+
