@@ -12,7 +12,7 @@ Requires the Fronius Solar API v1 to work (Can be found on Fronius Symo, Galvo, 
 
 In addition, it requires a principal Fronius smart meter installed directly alongside your main electricity meter for displaying actual grid metrics. This must obviously be connected to your main inverter. It also works with additional/supplemental inverters not connected directly to the main inverter but registered with help of a separate, Fronius Smart Meter.
 
-Only works in IPv4 networks.
+Only works in IPv4 networks preferrably with subnet 255.255.255.0 / 24.
 
 ## Features
 
