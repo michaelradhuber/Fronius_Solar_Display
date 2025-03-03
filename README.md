@@ -1,4 +1,4 @@
-![20x4 LCD solar display](images/20250226_122448.jpg)
+![20x4 LCD solar display](images/20250303_173028.jpg)
 
 # Fronius Solar Display
 
@@ -85,7 +85,7 @@ If later on you want to re-connect to the WiFi-Manager configuration portal just
 
 ## Case
 
-A nice case template for your 3d printer can be found here: https://www.thingiverse.com/thing:2627756
+A nice slightly modified case template for your 3d printer can be found in the case directory (CC by attribution license), the original by Robine is here: https://www.thingiverse.com/thing:2627756. You will need some hot glue to fix the parts in.
 
 ## Troubleshooting
 
