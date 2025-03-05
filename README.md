@@ -102,4 +102,3 @@ This project is licensed under the CC-BY-NC: https://creativecommons.org/license
 - [ArduinoJson](https://github.com/bblanchon/ArduinoJson) by Benoit Blanchon
 - [WiFiManager](https://github.com/tzapu/WiFiManager) by tzapu
 - [PlatformIO](https://platformio.org/) for the development environment
-- [netscanner-lib](attached) has been developed based on some code  https://github.com/agentzex/ESP_network_ip_scanner by agentzex
