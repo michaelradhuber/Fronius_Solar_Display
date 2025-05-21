@@ -417,7 +417,23 @@ gridVoltage getGridVoltage() {
     DEBUG_PRINTLN(error.f_str());
     return gV;
   }
-  if (doc["Body"]["Data"]["0"]["Voltage_AC_Phase_1"] == nullptr) {
+  // Find the primary meter key
+  JsonObject data = doc["Body"]["Data"].as<JsonObject>();
+  JsonObject primaryMeter;
+  for (JsonPair kv : data) {
+    JsonObject meter = kv.value().as<JsonObject>();
+    const char* location = meter["Meter_Location"];
+    if (location && strcmp(location, "Primary") == 0) {
+      primaryMeter = meter;
+      break;
+    }
+  }
+  // If not found, fallback to first meter
+  if (primaryMeter.isNull() && data.size() > 0) {
+    primaryMeter = data.begin()->value().as<JsonObject>();
+  }
+
+  if (primaryMeter.isNull() || primaryMeter["Voltage_AC_Phase_1"] == nullptr) {
     DEBUG_PRINTLN(F("Meter data not available"));
     connectErrors++;
     return gV;
@@ -589,6 +605,41 @@ void loop() {
     wm.startConfigPortal(WIFI_APN);
     configPortal = true;
   }
+
+  // If config portal timed out and WiFi is not connected, try reconnecting or restart
+if (configPortal && !wm.getConfigPortalActive() && WiFi.status() != WL_CONNECTED) {
+  DEBUG_PRINTLN(F("Config portal timed out, retrying WiFi connection..."));
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(F("Config portal"));
+  lcd.setCursor(0,1);
+  lcd.print(F("timed out..."));
+  lcd.setCursor(0,2);
+  lcd.print(F("Retrying WiFi..."));
+  WiFi.begin();
+  long retryTimeout = millis() + 10000;
+  while (WiFi.status() != WL_CONNECTED && millis() < retryTimeout) {
+    delay(500);
+    DEBUG_PRINT(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    DEBUG_PRINTLN(F("WiFi reconnected!"));
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print(F("WiFi reconnected!"));
+    delay(1000);
+    configPortal = false;
+  } else {
+    DEBUG_PRINTLN(F("WiFi reconnect failed, restarting..."));
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print(F("WiFi failed,"));
+    lcd.setCursor(0,1);
+    lcd.print(F("restarting..."));
+    delay(2000);
+    ESP.restart();
+  }
+}
 
   // If inverter IP is set but MAC is not, and WiFi is connected, resolve MAC
   if (inverterIPSet && !inverterMACSet && WiFi.status() == WL_CONNECTED) {
