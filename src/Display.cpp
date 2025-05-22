@@ -421,12 +421,12 @@ gridVoltage getGridVoltage() {
   JsonObject data = doc["Body"]["Data"].as<JsonObject>();
   JsonObject primaryMeter;
   for (JsonPair kv : data) {
-    JsonObject meter = kv.value().as<JsonObject>();
-    const char* location = meter["Meter_Location"];
-    if (location && strcmp(location, "Primary") == 0) {
-      primaryMeter = meter;
-      break;
-    }
+      JsonObject meter = kv.value().as<JsonObject>();
+      float location = meter["Meter_Location_Current"].as<float>();
+      if (location == 0.0) {
+        primaryMeter = meter;
+        break;
+      }
   }
   // If not found, fallback to first meter
   if (primaryMeter.isNull() && data.size() > 0) {
@@ -439,9 +439,9 @@ gridVoltage getGridVoltage() {
     return gV;
   }
   // Extract values
-  float UAC_L1 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_1"].as<float>();
-  float UAC_L2 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_2"].as<float>();
-  float UAC_L3 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_3"].as<float>();
+  float UAC_L1 = primaryMeter["Voltage_AC_Phase_1"].as<float>();
+  float UAC_L2 = primaryMeter["Voltage_AC_Phase_2"].as<float>();
+  float UAC_L3 = primaryMeter["Voltage_AC_Phase_3"].as<float>();
   gV.L1 = UAC_L1;
   gV.L2 = UAC_L2;
   gV.L3 = UAC_L3;
