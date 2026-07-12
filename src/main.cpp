@@ -135,7 +135,6 @@ void saveParamCallback();
 void resolveMAC();
 bool portalActive();
 void openPortal();
-void closePortal();
 void setupOTA();
 void runInverterHandshake();
 void drawPowerScreen(const PowerData &prm, const GridVoltage &gv);
@@ -245,11 +244,11 @@ void loop() {
 
   checkButton();
 
-  // Inverter IP still unknown -> open the portal so the user can enter it.
+  // Keep the LAN web portal up for as long as we have WiFi: it is the only way to
+  // change the inverter IP later, and it costs nothing but the web server.
   // Guarded by portalActive(): v1 called startConfigPortal() on every loop
   // iteration, restarting the portal continuously.
-  if (!inverterIPSet && WiFi.status() == WL_CONNECTED && !portalActive()) {
-    DEBUG_PRINTLN(F("Inverter IP not set, opening portal"));
+  if (WiFi.status() == WL_CONNECTED && !portalActive()) {
     openPortal();
   }
 
@@ -673,21 +672,15 @@ void openPortal() {
   if (WiFi.status() == WL_CONNECTED) {
     wm.startWebPortal();
     DEBUG_PRINTF("Web portal: http://%s/\n", WiFi.localIP().toString().c_str());
-    lcdMessage("Set inverter IP at", WiFi.localIP().toString().c_str());
+    // Only claim the LCD while the inverter IP is still missing - once it is set
+    // the portal is just sitting there for later edits, and the power screen owns
+    // the display.
+    if (!inverterIPSet) {
+      lcdMessage("Set inverter IP at", WiFi.localIP().toString().c_str());
+    }
   } else {
     lcdMessage("WIFI: Starting", "config portal:", WIFI_APN, "192.168.4.1");
     wm.startConfigPortal(WIFI_APN);
-  }
-}
-
-void closePortal() {
-  if (wm.getWebPortalActive()) {
-    wm.stopWebPortal();
-  } else if (wm.getConfigPortalActive() && WiFi.status() == WL_CONNECTED) {
-    // Only safe to drop the AP portal once WiFi is up. Closing it while still
-    // unconfigured strands the device: loop() can only reopen a portal when
-    // connected, so there would be no way back in short of a power cycle.
-    wm.stopConfigPortal();
   }
 }
 
@@ -745,8 +738,11 @@ void saveParamCallback() {
   preferences.putBool("inverterMACSet", false);
   initSuccess = false;
 
-  // Don't resolve here: ARP is async and would need to block. loop() polls it.
-  closePortal();
+  // Leave the portal up. It used to be torn down here, which - on the soft-AP
+  // portal - killed it before WiFi credentials had been saved, stranding the
+  // device. loop() reopens the web portal anyway, so closing it achieved nothing.
+  // Don't resolve the MAC here either: ARP is async and would need to block.
+  // loop() polls it.
 }
 
 /* ---- ARP / MAC resolution ---- */
