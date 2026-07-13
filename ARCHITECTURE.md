@@ -99,6 +99,31 @@ release BOOT.
 
 > If the board does *not* enumerate, suspect the LCD pinout before suspecting drivers.
 
+### Building from the `X:` share
+
+This tree lives on a VPN-mounted SMB share, and that breaks two things.
+
+**SCons cannot write its signature database over SMB.** A build dies at the end with
+`OSError: [Errno 22] Invalid argument: ...\.pio\build\...\.sconsign311.tmp`, *after* the
+compile has already succeeded — so it looks like a code failure but isn't. Put the build
+directory on a local disk:
+
+```bash
+PLATFORMIO_BUILD_DIR=C:/pio-build/fronius-display-v2 pio run
+```
+
+**The VPN and the display are mutually exclusive.** `X:` *is* the VPN, but the display is
+on the local LAN and OTA can't reach it while the VPN is up. So the order is: build with the
+VPN up (source must be reachable), drop the VPN, then flash. Once the VPN is down the source
+tree is gone, so PlatformIO can't run — push the already-built binary with `espota.py`
+directly, which needs no project directory:
+
+```bash
+python "$HOME/.platformio/packages/framework-arduinoespressif32/tools/espota.py" \
+  -i solar-display.local -p 3232 -a changeme \
+  -f C:/pio-build/fronius-display-v2/waveshare-esp32-s3-eth/firmware.bin -r -d
+```
+
 ---
 
 ## Runtime state machine
