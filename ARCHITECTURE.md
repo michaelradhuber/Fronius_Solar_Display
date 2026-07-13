@@ -42,6 +42,44 @@ Button                          GPIO0 (BOOT, INPUT_PULLUP)
 
 Free and safe: `4–8, 15–18, 21, 38–44, 47`.
 
+### The antenna switch (0 R resistor)
+
+**This board ships wired to its on-board PCB antenna, and plugging an antenna into the IPEX
+connector does nothing until you move a 0 Ω resistor.** From the
+[Waveshare wiki](docs/ESP32-S3-ETH%20-%20Waveshare%20Wiki.pdf) FAQ, *"How to switch to the
+external antenna for IPEX 1 generation"*:
+
+> the default weld is a **vertical** 0R resistor. If you want to switch to an external antenna,
+> you need to re-solder the 0R resistor to a **horizontal** position.
+
+| Bridge | Selects |
+|---|---|
+| **Vertical** (factory default) | On-board PCB antenna |
+| **Horizontal** | External antenna on the IPEX / u.FL connector |
+
+This cost a lot of debugging time. The display sat at **-80 to -90 dBm from an AP 8 m away in
+the same room, line of sight** — where free-space loss says it should read in the **-40s**. A
+30-45 dB deficit is not distance, clutter or a bad router; it is a broken RF path. The
+symptoms it produced looked exactly like flaky WiFi: dropped associations, inverter polls
+timing out, and the AP periodically needing a restart before the display could rejoin (an
+access point will give up on a station it can barely hear).
+
+Two traps, both of which we walked into:
+
+- **The naming is a coin-flip and the default is "internal".** Bridging *vertical* — the
+  intuitive "I soldered the thing" move — selects the on-board antenna, i.e. the one you were
+  trying to replace.
+- **Soldering the antenna directly to the bridge pads "works", and is still wrong.** Any
+  conductor on the RF feed radiates, so RSSI *improves* and the change looks correct. But the
+  feed is a 50 Ω impedance-controlled node expecting exactly one load. Leave the vertical
+  bridge in place and solder an antenna on top, and both radiators hang off it in parallel:
+  the match is destroyed and much of the power reflects back into the radio. **Relative
+  improvement proves the path was starved. It does not prove the new path is good** — only the
+  absolute number does, and -85 dBm at 8 m is not good.
+
+Correct configuration: horizontal bridge **only** (remove every trace of the vertical one),
+antenna clicked onto the **u.FL connector**, never soldered to the pads.
+
 ### Ethernet (not used)
 
 The board is an *ETH* variant, but the firmware is WiFi-only. The `Ethernet_Generic`
@@ -221,14 +259,17 @@ Two supporting changes make this work:
 
 ### Radio tuning (`tuneRadio()`)
 
-**The link is marginal: the AP measures -80 to -90 dBm at the display.** The ESP32 wants
-roughly -70 dBm or better to be stable, so this installation sits right at the edge of the
-usable range. That single fact explains the dropped associations, the inverter polls timing
-out, and the router occasionally needing a restart before the display can rejoin (an AP will
-happily give up on a station it can barely hear).
+Written while the display was reading **-80 to -90 dBm** and the link was dropping constantly.
+That turned out to be a hardware fault, not a site problem — see
+[The antenna switch](#the-antenna-switch-0-r-resistor). Do not read this section as evidence
+that the installation is inherently marginal; **8 m of clear line-of-sight should read in the
+-40s**, and if it doesn't, fix the antenna before touching anything here.
 
-`tuneRadio()` trades away everything we don't need for link margin, which is the only thing
-we are short of:
+The tuning is still worth having — it is what you want on any WiFi link you cannot make short
+— but it buys single-digit dB. It cannot rescue a broken RF path, and it was never the reason
+the display kept falling off the network.
+
+`tuneRadio()` trades away everything we don't need for link margin:
 
 | Setting | Why |
 |---|---|
@@ -248,10 +289,6 @@ we are short of:
 power-save, bandwidth and TX power to the IDF defaults. Setting them once in `setup()` would
 silently lose them the first time the display fell back to the AP, i.e. exactly when they
 matter most.
-
-None of this fixes the underlying RF problem. **The board is an ESP32-S3-*ETH* with an unused
-W5500 on it** ([Ethernet](#ethernet-not-used)) — a cable makes this whole class of failure
-disappear, and remains the real answer if one can be run to the display.
 
 ### Persisted state (`Preferences`, namespace `inverter_config`)
 
