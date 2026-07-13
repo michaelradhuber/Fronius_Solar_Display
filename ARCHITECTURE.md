@@ -151,6 +151,11 @@ and most stages `return` so a single iteration does one thing.
        │ OTA::begin  │  (lazy: also fires if WiFi arrives later)
        └──────┬──────┘
               ▼
+        manageWiFi()  ◄─── every loop; see WiFi supervision below
+              │
+       WL_CONNECTED? ── no ──► reconnect / AP portal, and do nothing else
+              │ yes
+              ▼
       inverterIPSet?  ── no ──► open config portal, wait
               │ yes
               ▼
@@ -168,6 +173,85 @@ and most stages `return` so a single iteration does one thing.
     │  → drawPowerScreen()   │  >5 consecutive errors → reboot
     └────────────────────────┘  errors forgotten after 5 min
 ```
+
+### WiFi supervision (`manageWiFi()`)
+
+**Nothing else re-establishes the station link.** Not WiFiManager: its ESP32 disconnect
+handler only calls `WiFi.reconnect()` under `#ifdef esp32autoreconnect`, which is not
+defined. And not the Arduino core's silent auto-reconnect, because of this, in
+`WiFiManager::startConfigPortal()`:
+
+```cpp
+if(_disableSTA || (!WiFi.isConnected() && _disableSTAConn)){   // _disableSTAConn defaults true
+  WiFi_Disconnect();
+  WiFi_enableSTA(false);            // <-- the station interface is switched OFF
+}
+```
+
+Raising the soft-AP portal turns the station **off**. A device parked in that portal cannot
+see the router come back — there is nothing left to see it with. Neither v1 nor early v2 had
+any code to get out again, so a router outage was a one-way trip: poll errors → reboot →
+`autoConnect()` fails while the router is still down → AP portal → stranded until someone
+power-cycled it.
+
+`manageWiFi()` runs once per `loop()` and owns every transition:
+
+| State | Action |
+|---|---|
+| **Rising edge** (link came back) | Tear down the AP portal, clear `connectErrors`, start OTA if it was never started, repaint the LCD, force an immediate poll |
+| **Falling edge** (link dropped) | Note the time, tell the user, stop polling |
+| **Offline, no portal** | `WiFi.begin()` (saved NVS creds) every **20 s** |
+| **Offline > 2 min** | Raise the AP portal so the user *can* re-provision — without giving up on the saved network |
+| **AP portal idle > 3 min** | Take it down, switch the station back on, retry the saved credentials. If the router is still gone, the 2-minute timer raises the AP again |
+| **AP portal, client connected** | Leave it up. `WiFi.softAPgetStationNum() > 0` keeps pushing the deadline out, so it never dies under someone who is mid-configuration |
+| **AP portal, no saved SSID** | Leave it up forever. A fresh device has nothing to fall back to |
+
+So the device alternates AP ⇄ STA instead of committing to either, and always finds the
+router again on its own.
+
+Two supporting changes make this work:
+
+- **`wm.setConfigPortalTimeout(0)`.** WiFiManager's own portal timeout would shut the AP down
+  and leave the device with *neither* a portal nor a station link — LCD frozen on the "join
+  AP" screen, permanently. Portal lifetime is `manageWiFi()`'s job now.
+- **The poll loop returns early unless `WL_CONNECTED`.** Without that guard a WiFi outage
+  looked exactly like a dead inverter: the 5-second poll kept firing, every HTTP GET failed,
+  and six failures rebooted the box straight into the AP portal. The inverter is not at fault
+  for the router being down, and `connectErrors` no longer says it is.
+
+### Radio tuning (`tuneRadio()`)
+
+**The link is marginal: the AP measures -80 to -90 dBm at the display.** The ESP32 wants
+roughly -70 dBm or better to be stable, so this installation sits right at the edge of the
+usable range. That single fact explains the dropped associations, the inverter polls timing
+out, and the router occasionally needing a restart before the display can rejoin (an AP will
+happily give up on a station it can barely hear).
+
+`tuneRadio()` trades away everything we don't need for link margin, which is the only thing
+we are short of:
+
+| Setting | Why |
+|---|---|
+| `WiFi.setSleep(false)` | **The important one.** The default `WIFI_PS_MIN_MODEM` parks the radio between beacons. At -85 dBm missed beacons are common, and a run of them drops the association. The display is mains-powered — there is nothing to save |
+| `setTxPower(WIFI_POWER_19_5dBm)` | Full TX. See the caveat below |
+| `esp_wifi_set_bandwidth(HT20)` | A 40 MHz channel spreads the same power over twice the bandwidth: ~3 dB of receive sensitivity traded for throughput we have no use for (the payload is a few kB every 5 s) |
+| `esp_wifi_set_protocol(11B\|11G\|11N)` | Keep 802.11b. Dropping it as "legacy" is the obvious move and it is wrong: the b rates go down to 1 Mbps and have the best receiver sensitivity in the set — they are the rates that still carry a frame at -90 dBm |
+| `setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL)` | If the SSID is served by more than one radio, take the loudest rather than the first one found |
+
+> ⚠️ **TX power cannot improve the RSSI on the LCD.** That number is how well the *display
+> hears the router*; TX power governs how well the *router hears the display*. No transmitter
+> can talk itself louder into its own receiver. Expect the on-screen figure not to move — what
+> should improve is the AP no longer losing us mid-conversation.
+
+**`tuneRadio()` is re-applied on every reconnect, not just at boot.** A `WIFI_STA` →
+`WIFI_AP` mode change — precisely what a trip through the config portal is — resets
+power-save, bandwidth and TX power to the IDF defaults. Setting them once in `setup()` would
+silently lose them the first time the display fell back to the AP, i.e. exactly when they
+matter most.
+
+None of this fixes the underlying RF problem. **The board is an ESP32-S3-*ETH* with an unused
+W5500 on it** ([Ethernet](#ethernet-not-used)) — a cable makes this whole class of failure
+disappear, and remains the real answer if one can be run to the display.
 
 ### Persisted state (`Preferences`, namespace `inverter_config`)
 

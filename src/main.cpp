@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <Preferences.h>
+#include <esp_wifi.h>     // ps / bandwidth / protocol / tx-power knobs Arduino doesn't expose
 #include <lwip/etharp.h>
 #include <lwip/ip4_addr.h>
 #include <lwip/tcpip.h>   // LOCK_TCPIP_CORE / UNLOCK_TCPIP_CORE
@@ -76,6 +77,13 @@ static const uint32_t ARP_RETRY_FAST_MS = 1000;
 static const uint32_t ARP_RETRY_SLOW_MS = 30000;
 static const uint8_t  ARP_FAST_ATTEMPTS = 15;
 
+// WiFi supervision. Nothing else re-establishes the STA link: WiFiManager's ESP32
+// disconnect handler only reconnects under #ifdef esp32autoreconnect (not defined),
+// and startConfigPortal() actively turns the station interface OFF. So we drive it.
+static const uint32_t WIFI_RETRY_MS     = 20000;   // between reconnect attempts
+static const uint32_t WIFI_GRACE_MS     = 120000;  // offline this long -> raise the AP
+static const uint32_t AP_PORTAL_MAX_MS  = 180000;  // ...then drop it and retry the STA
+
 char IP_char[IP_LEN]   = "";
 char MAC_char[MAC_LEN] = "";
 
@@ -101,6 +109,12 @@ bool initSuccess          = false;
 bool otaReady             = false;
 uint32_t pollTimeout      = 0;
 uint32_t errorTimeout     = 0;
+
+bool     wifiOnline       = false;  // last observed link state, for edge detection
+bool     haveSavedWiFi    = false;  // are there credentials to fall back on?
+uint32_t offlineSince     = 0;      // millis() of the drop, 0 while online
+uint32_t lastWifiRetry    = 0;
+uint32_t apPortalStarted  = 0;      // millis() the soft-AP portal was raised
 
 WiFiManager wm;
 WiFiManagerParameter inverter_input;
@@ -135,6 +149,9 @@ void saveParamCallback();
 void resolveMAC();
 bool portalActive();
 void openPortal();
+void openAPPortal();
+void manageWiFi();
+void tuneRadio();
 void setupOTA();
 void runInverterHandshake();
 void drawPowerScreen(const PowerData &prm, const GridVoltage &gv);
@@ -175,6 +192,21 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   delay(100);
+  tuneRadio();
+
+  // The link to the AP is marginal (-80..-90 dBm), so if the SSID is served by more than
+  // one radio - a mesh node, an extender, the router's own 2.4 GHz - always take the
+  // loudest. The default is to connect to the first match found, which at this signal
+  // level may well be the worst one.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+
+  // Ask exactly once, here, while the station interface is definitely up: getWiFiIsSaved()
+  // ends in esp_wifi_get_config(WIFI_IF_STA, &conf) with the return value ignored, so with
+  // the station disabled - which is precisely the state the AP portal leaves us in - it can
+  // hand back uninitialized stack garbage. manageWiFi() reads this latch instead of asking.
+  haveSavedWiFi = wm.getWiFiIsSaved();
+  DEBUG_PRINTF("WIFI: saved credentials: %s\n", haveSavedWiFi ? "yes" : "no");
 
   // Load persisted config
   preferences.begin("inverter_config", false);
@@ -207,7 +239,10 @@ void setup() {
   std::vector<const char *> menu = {"wifi", "info", "param", "sep", "restart", "exit"};
   wm.setMenu(menu);
   wm.setClass("invert");
-  wm.setConfigPortalTimeout(600);
+  // Portal lifetime is ours, not WiFiManager's: its timeout would shut the AP down
+  // and leave the device with neither a portal nor a station link. manageWiFi()
+  // cycles AP <-> STA instead, so the device always finds the router again.
+  wm.setConfigPortalTimeout(0);
   wm.setCaptivePortalEnable(false);
   wm.setAPClientCheck(true);
 
@@ -215,6 +250,7 @@ void setup() {
   if (wm.autoConnect(WIFI_APN)) {
     DEBUG_PRINTLN(F("WIFI: connected"));
     lcdMessage("WIFI: connected...");
+    wifiOnline = true;
     setupOTA();
     otaReady = true;
     delay(1000);
@@ -222,8 +258,12 @@ void setup() {
     // autoConnect() has already brought up the soft-AP portal itself. Don't mirror
     // that in a local flag: WiFiManager closes this portal on its own once WiFi is
     // saved (_disableConfigPortal), and would leave the mirror stuck true forever.
+    // Do record when it went up - manageWiFi() takes it down again to retry the STA.
     DEBUG_PRINTLN(F("WIFI: not connected - AP config portal open"));
     lcdMessage("WIFI: failed to", "connect, join AP:", WIFI_APN, "192.168.4.1");
+    wifiOnline      = false;
+    offlineSince    = millis();
+    apPortalStarted = millis();
   }
 
   DEBUG_PRINTF("Saved inverter IP:  %s\n", IP_char[0]  ? IP_char  : "(none)");
@@ -233,13 +273,10 @@ void setup() {
 void loop() {
   if (wm_nonblocking) wm.process();
 
-  // WiFi may only come up later, via the config portal - start OTA when it does.
-  if (WiFi.status() == WL_CONNECTED && !otaReady) {
-    DEBUG_PRINTLN(F("WIFI: connected"));
-    lcdMessage("WIFI: connected...");
-    setupOTA();
-    otaReady = true;
-  }
+  // Owns every WiFi state transition: reconnects a dropped link, raises the AP portal
+  // when the outage is long, and tears that portal back down so the STA can retry.
+  manageWiFi();
+
   if (otaReady) ArduinoOTA.handle();
 
   checkButton();
@@ -252,14 +289,19 @@ void loop() {
     openPortal();
   }
 
-  if (inverterIPSet && !inverterMACSet && WiFi.status() == WL_CONNECTED) {
+  // Everything below needs the network. Without this guard a WiFi outage looked
+  // exactly like a dead inverter: the poll kept firing, every GET failed, and six
+  // failures rebooted the device straight into the AP portal.
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (inverterIPSet && !inverterMACSet) {
     resolveMAC();
     return;
   }
 
   // One-time handshake: confirm the box at IP_char is still our inverter, and
   // that it speaks Solar API v1.
-  if (WiFi.status() == WL_CONNECTED && inverterIPSet && inverterMACSet && !initSuccess) {
+  if (inverterIPSet && inverterMACSet && !initSuccess) {
     runInverterHandshake();
     return;
   }
@@ -665,6 +707,54 @@ void setupOTA() {
                WiFi.localIP().toString().c_str());
 }
 
+/* ---- Radio tuning ---- */
+
+// Everything here is aimed at one problem: the AP is only -80..-90 dBm away, which is
+// the edge of the ESP32's usable range. None of it is free performance - it is all
+// trading things we do not need (power, throughput, 40 MHz channels) for link margin,
+// which is the only thing we are short of.
+//
+// Re-applied on every reconnect, not just at boot: a WIFI_STA -> WIFI_AP mode change,
+// which is exactly what a trip through the config portal does, resets these to the IDF
+// defaults. Setting them once in setup() would silently lose them the first time the
+// display fell back to the AP.
+void tuneRadio() {
+  // The big one. The default power-save mode (WIFI_PS_MIN_MODEM) parks the radio
+  // between the AP's beacons. At -85 dBm a missed beacon is not a rare event, and a
+  // run of them is a dropped association - which is very likely what has been knocking
+  // this display off the air. The display is mains-powered; there is nothing to save.
+  WiFi.setSleep(false);
+
+  // Full transmit power.
+  //
+  // Be clear about what this does and does not buy: it improves the UPLINK, i.e. how
+  // well the Zyxel hears the display. It cannot improve the RSSI on the LCD, which is
+  // how well the display hears the Zyxel - no transmitter can talk itself louder into
+  // its own receiver. Expect the number on screen to stay where it is; what should
+  // improve is the AP no longer losing us mid-conversation.
+  //
+  // Must come after esp_wifi_start() - i.e. after WiFi.mode() - or it is silently
+  // dropped. 19.5 dBm is the Arduino enum's ceiling and the module's practical max.
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  // Force 20 MHz. A 40 MHz channel spreads the same transmit power across twice the
+  // bandwidth and costs roughly 3 dB of receive sensitivity - a straight trade of range
+  // for throughput, and we have no use for throughput. The payload is a few kB every
+  // five seconds.
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+  // Keep 802.11b in the protocol set. Dropping it as "legacy" is the obvious-looking
+  // move and it is wrong here: the b rates go down to 1 Mbps and have far and away the
+  // best receiver sensitivity in the set. They are the rates that still carry a frame
+  // at -90 dBm. This is a range problem, so we want every slow robust rate available.
+  esp_wifi_set_protocol(WIFI_IF_STA,
+                        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+
+  int8_t txq = 0;
+  esp_wifi_get_max_tx_power(&txq);  // reported in 0.25 dBm units
+  DEBUG_PRINTF("WIFI: radio tuned - sleep off, HT20, B/G/N, TX %.2f dBm\n", txq / 4.0f);
+}
+
 /* ---- WiFi / config portal ---- */
 
 // Two different portals, and picking the wrong one is why the device was unreachable
@@ -699,8 +789,110 @@ void openPortal() {
       lcdMessage("Set inverter IP at", WiFi.localIP().toString().c_str());
     }
   } else {
-    lcdMessage("WIFI: Starting", "config portal:", WIFI_APN, "192.168.4.1");
-    wm.startConfigPortal(WIFI_APN);
+    openAPPortal();
+  }
+}
+
+// Raises the soft-AP portal (SSID SOLAR_POWER_DISPLAY, 192.168.4.1).
+//
+// This is a one-way door as far as WiFi is concerned: startConfigPortal() calls
+// WiFi_Disconnect() + WiFi_enableSTA(false) whenever the station is not connected,
+// so while the AP is up the device cannot see - let alone rejoin - the router. That
+// is exactly how the display got stranded: a router outage bounced it in here and
+// nothing ever brought the station back. manageWiFi() therefore times this portal
+// out and retries the saved credentials.
+void openAPPortal() {
+  if (wm.getConfigPortalActive()) return;
+
+  // startConfigPortal() only guards against configPortalActive, not webPortalActive:
+  // starting it on top of a live web portal would re-create the HTTP server under the
+  // old one. Take the web portal down first.
+  if (wm.getWebPortalActive()) wm.stopWebPortal();
+
+  DEBUG_PRINTLN(F("WIFI: starting AP config portal"));
+  lcdMessage("WIFI: Starting", "config portal:", WIFI_APN, "192.168.4.1");
+  apPortalStarted = millis();
+  wm.startConfigPortal(WIFI_APN);
+}
+
+// The whole WiFi lifecycle, edge-triggered. Called once per loop().
+void manageWiFi() {
+  const bool online = (WiFi.status() == WL_CONNECTED);
+
+  if (online) {
+    if (!wifiOnline) {  // rising edge: we just (re)joined the router
+      wifiOnline    = true;
+      haveSavedWiFi = true;  // we are associated, so credentials exist by definition
+      offlineSince  = 0;
+
+      // The AP portal is meaningless now, and it is what was covering the LCD.
+      // loop() reopens the LAN web portal on the next iteration.
+      if (wm.getConfigPortalActive()) wm.stopConfigPortal();
+
+      // A mode change resets power-save, bandwidth and TX power to the IDF defaults,
+      // and getting here from the AP portal means we just did one.
+      tuneRadio();
+
+      connectErrors = 0;  // the outage was ours, not the inverter's
+      errorTimeout  = 0;
+
+      DEBUG_PRINTF("WIFI: connected, IP %s\n", WiFi.localIP().toString().c_str());
+      lcdMessage("WIFI: connected", WiFi.localIP().toString().c_str());
+
+      if (!otaReady) {  // WiFi may only arrive here, via the portal
+        setupOTA();
+        otaReady = true;
+      }
+      pollTimeout = millis() - POLL_INTERVAL_MS;  // repaint the power screen at once
+    }
+    return;
+  }
+
+  /* ---- offline ---- */
+
+  if (wifiOnline) {  // falling edge
+    wifiOnline    = false;
+    offlineSince  = millis();
+    lastWifiRetry = 0;
+    DEBUG_PRINTLN(F("WIFI: connection lost"));
+    lcdMessage("WIFI: connection", "lost, retrying...");
+  }
+  if (offlineSince == 0) offlineSince = millis();
+
+  if (wm.getConfigPortalActive()) {
+    // Someone is on the AP configuring - keep it up, and keep pushing the deadline.
+    if (WiFi.softAPgetStationNum() > 0) {
+      apPortalStarted = millis();
+      return;
+    }
+    // Nothing saved to fall back to (fresh device): the portal is the only way in.
+    if (!haveSavedWiFi) return;
+
+    if ((millis() - apPortalStarted) < AP_PORTAL_MAX_MS) return;
+
+    // Nobody came. Drop the AP so the station can be switched back on and look for
+    // the router again; if it is still gone, the grace timer raises the AP anew.
+    DEBUG_PRINTLN(F("WIFI: AP portal idle, retrying saved credentials"));
+    lcdMessage("WIFI: retrying", "saved network...");
+    wm.stopConfigPortal();
+    offlineSince  = millis();
+    lastWifiRetry = 0;
+    return;
+  }
+
+  // No portal in the way: bang on the saved credentials.
+  if (lastWifiRetry == 0 || (millis() - lastWifiRetry) > WIFI_RETRY_MS) {
+    lastWifiRetry = millis();
+    DEBUG_PRINTLN(F("WIFI: reconnecting..."));
+    WiFi.mode(WIFI_STA);  // may have been turned off by a previous AP portal
+    WiFi.begin();         // no args: reuse the credentials in NVS
+  }
+
+  // Long outage, and the router is not coming back on its own terms. Offer the AP so
+  // the user can point the display at a different network - without giving up on the
+  // saved one, which the AP timeout above keeps retrying.
+  if ((millis() - offlineSince) > WIFI_GRACE_MS) {
+    openAPPortal();
   }
 }
 
