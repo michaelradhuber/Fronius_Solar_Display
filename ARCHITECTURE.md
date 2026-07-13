@@ -8,6 +8,10 @@ v2 is a port of the original `Fronius_Solar_Display` (ESP32 WROOM DA / DevKit V1
 new pinout, and a set of latent memory bugs were fixed along the way (see
 [Bugs fixed in the port](#bugs-fixed-in-the-port)).
 
+**Pre-port source (v1):** `X:\Code\PlatformIO\Projects\Fronius_Solar_Display` — a separate
+git repo whose whole application lives in one file, `src/Display.cpp`. It is the reference
+for anything in this document that says "v1 did X".
+
 ---
 
 ## Hardware
@@ -171,6 +175,12 @@ The sweep is slow by design (254 addresses × 500 ms ≈ **2 minutes**) — henc
 
 Base: `http://<inverter_ip>`
 
+Reference documents, both in [docs/](docs/):
+
+- [solar_api.pdf](docs/solar_api.pdf) — Fronius Solar API v1 specification. Section **4.8**
+  covers `GetMeterRealtimeData`; **4.8.5** defines the channels used here.
+- [solarApiv1.json](docs/solarApiv1.json) — JSON schema for the same responses.
+
 | Endpoint | Used for |
 |---|---|
 | `/solar_api/GetAPIVersion.cgi` | Handshake. `APIVersion` must be `1`, else reboot. |
@@ -190,6 +200,24 @@ true — also adds `SecondaryMeters[1..9].P` for meters whose `Category` is
 
 **Voltage deviation** takes the phase furthest from nominal 230 V and reports it as a
 percentage — `100%` is nominal, `106%` means a phase is sitting ~244 V.
+
+The meter to read it from is **not** at a fixed key. `Body.Data` is an object keyed by meter
+*device ID*, and those IDs are assigned by the Datamanager: this system, with a grid meter
+and a second one on the Carport, reports them as `"2"` and `"3"` — there is no `"0"` at all.
+Both v1 and early v2 hardcoded `Body.Data.0`, so the lookup silently missed and the display
+sat at `0%gV` forever.
+
+`getGridVoltage()` now selects by `Meter_Location_Current` (spec 4.8.5):
+
+| Value | Meaning | Used? |
+|---|---|---|
+| `0` | Grid interconnection point (primary meter) | **Yes — this is the one we want** |
+| `1` | Load path (primary meter) | Fallback only |
+| `3` | External generator (secondary, e.g. the Carport meter) | Never |
+| `256`–`511` | Subloads (secondary) | Never |
+
+A secondary meter reports the voltage at *its own* connection point, not at the grid feed­-in
+point, so it must never be picked for gV.
 
 ## The display
 

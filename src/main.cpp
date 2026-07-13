@@ -480,15 +480,35 @@ GridVoltage getGridVoltage() {
     noteConnectError();
     return gV;
   }
-  if (doc["Body"]["Data"]["0"]["Voltage_AC_Phase_1"].isNull()) {
+  // Body.Data is keyed by meter device ID, and that ID is NOT necessarily "0":
+  // the IDs come from the Datamanager, and a system with two Smart Meters can report
+  // them as "2" and "3" with no "0" at all. Select by Meter_Location_Current instead
+  // (Solar API v1 spec 4.8.5): 0 = grid interconnection point (primary meter),
+  // 1 = load (primary), 3 = external generator, 256-511 = subloads (both secondary).
+  // We want the grid meter; only fall back to a load-path primary, never a secondary -
+  // the Carport generator meter would report its own voltages, not the grid's.
+  JsonObject meters = doc["Body"]["Data"].as<JsonObject>();
+  JsonObject meter;
+  for (JsonPair entry : meters) {
+    JsonObject m = entry.value().as<JsonObject>();
+    if (m["Voltage_AC_Phase_1"].isNull()) continue;
+
+    int location = m["Meter_Location_Current"].as<int>();
+    if (location == 0) {  // grid interconnection point - what we're after
+      meter = m;
+      break;
+    }
+    if (location == 1 && meter.isNull()) meter = m;  // load-path primary, second choice
+  }
+  if (meter.isNull()) {
     DEBUG_PRINTLN(F("Meter data not available"));
     noteConnectError();
     return gV;
   }
 
-  gV.L1 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_1"].as<float>();
-  gV.L2 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_2"].as<float>();
-  gV.L3 = doc["Body"]["Data"]["0"]["Voltage_AC_Phase_3"].as<float>();
+  gV.L1 = meter["Voltage_AC_Phase_1"].as<float>();
+  gV.L2 = meter["Voltage_AC_Phase_2"].as<float>();
+  gV.L3 = meter["Voltage_AC_Phase_3"].as<float>();
 
   // Report whichever phase deviates furthest from nominal 230 V.
   float UACmax = max(gV.L1, max(gV.L2, gV.L3));
