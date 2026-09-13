@@ -84,6 +84,14 @@ static const uint32_t WIFI_RETRY_MS     = 20000;   // between reconnect attempts
 static const uint32_t WIFI_GRACE_MS     = 120000;  // offline this long -> raise the AP
 static const uint32_t AP_PORTAL_MAX_MS  = 180000;  // ...then drop it and retry the STA
 
+// Boot connect: classic blocking begin-and-wait, retried, BEFORE WiFiManager runs.
+// wm.autoConnect() makes exactly one attempt with no timeout and no retries
+// (_connectTimeout=0, _connectRetries=1): a transient radio/netif bring-up failure
+// fails in ~0 ms - silently, the core only log_e()s it - and drops the device
+// straight into the AP portal without ever having tried the router.
+static const uint8_t  WIFI_BOOT_ATTEMPTS   = 2;      // 2 x 10 s = max 20 s before letting go
+static const uint32_t WIFI_BOOT_ATTEMPT_MS = 10000;  // per-attempt connect window
+
 char IP_char[IP_LEN]   = "";
 char MAC_char[MAC_LEN] = "";
 
@@ -194,12 +202,28 @@ void setup() {
   delay(100);
   tuneRadio();
 
-  // The link to the AP is marginal (-80..-90 dBm), so if the SSID is served by more than
-  // one radio - a mesh node, an extender, the router's own 2.4 GHz - always take the
-  // loudest. The default is to connect to the first match found, which at this signal
-  // level may well be the worst one.
+  // The SSID is served by FOUR routers in and around the house, so always take the
+  // loudest. Two places must agree on that:
+  //
+  // 1) These setters - but they only apply to connects that pass an explicit SSID
+  //    (the config portal's save path). The no-arg WiFi.begin() used everywhere else
+  //    (boot loop, manageWiFi retries) reuses the wifi_config_t stored in NVS verbatim.
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+
+  // 2) The stored config itself, which may still carry the core default from whenever
+  //    the credentials were last saved: WIFI_FAST_SCAN = first BSSID that answers wins,
+  //    i.e. a 1-in-4 lottery. Rewrite it in place; esp_wifi_set_config persists to NVS,
+  //    so every later no-arg begin() inherits all-channel + by-signal.
+  {
+    wifi_config_t conf;
+    if (esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK) {
+      conf.sta.scan_method     = WIFI_ALL_CHANNEL_SCAN;
+      conf.sta.sort_method     = WIFI_CONNECT_AP_BY_SIGNAL;
+      conf.sta.threshold.rssi  = -127;  // never skip a candidate for being weak
+      esp_wifi_set_config(WIFI_IF_STA, &conf);
+    }
+  }
 
   // Ask exactly once, here, while the station interface is definitely up: getWiFiIsSaved()
   // ends in esp_wifi_get_config(WIFI_IF_STA, &conf) with the return value ignored, so with
@@ -246,7 +270,31 @@ void setup() {
   wm.setCaptivePortalEnable(false);
   wm.setAPClientCheck(true);
 
-  // Try saved credentials first; only fall back to the portal if they fail.
+  // Classic blocking connect, the old way: begin(), wait, retry - and only after
+  // every attempt has failed is WiFiManager allowed to raise the AP portal. Nothing
+  // else runs until this window has passed. Re-issuing begin() also retries the
+  // whole STA bring-up, which is what fails on the bad boots.
+  if (haveSavedWiFi) {
+    for (uint8_t attempt = 1;
+         attempt <= WIFI_BOOT_ATTEMPTS && WiFi.status() != WL_CONNECTED; attempt++) {
+      DEBUG_PRINTF("WIFI: boot connect, attempt %u/%u\n", attempt, WIFI_BOOT_ATTEMPTS);
+      char line[21];
+      snprintf(line, sizeof(line), "attempt %u of %u", attempt, WIFI_BOOT_ATTEMPTS);
+      lcdMessage("WIFI: connecting...", line);
+
+      WiFi.begin();  // no args: the credentials saved in NVS
+      uint32_t t0 = millis();
+      while (WiFi.status() != WL_CONNECTED && (millis() - t0) < WIFI_BOOT_ATTEMPT_MS) {
+        delay(250);
+      }
+    }
+    DEBUG_PRINTF("WIFI: boot connect %s\n",
+                 WiFi.status() == WL_CONNECTED ? "succeeded" : "failed - falling back to portal");
+  }
+
+  // Already connected by the loop above -> autoConnect() sees WL_CONNECTED and
+  // returns true immediately. Only if all attempts failed does it get one try of
+  // its own and then raise the AP portal, same as before.
   if (wm.autoConnect(WIFI_APN)) {
     DEBUG_PRINTLN(F("WIFI: connected"));
     lcdMessage("WIFI: connected...");

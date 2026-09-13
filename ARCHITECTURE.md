@@ -174,7 +174,9 @@ and most stages `return` so a single iteration does one thing.
   boot ───────────► │ splash (LCD) │
                     └──────┬───────┘
                            ▼
-                  wm.autoConnect()          saved WiFi creds
+              boot connect loop (blocking)  2 × 10 s on saved creds; see below
+                           ▼
+                  wm.autoConnect()          already connected → returns true
                            │
               ┌────────────┴────────────┐
          connected                  not connected
@@ -211,6 +213,25 @@ and most stages `return` so a single iteration does one thing.
     │  → drawPowerScreen()   │  >5 consecutive errors → reboot
     └────────────────────────┘  errors forgotten after 5 min
 ```
+
+### Boot connect loop (before WiFiManager runs)
+
+`wm.autoConnect()` cannot be trusted to actually *try*. It makes exactly **one** attempt
+with **no timeout and no retries** (`_connectTimeout = 0`, `_connectRetries = 1`), and the
+Arduino 3.x core fails that attempt in ~0 ms on any transient bring-up hiccup —
+`enableSTA()` failing, `ESP_NETIF_STARTED_BIT` not arriving within 1 s, or
+`esp_wifi_connect()` erroring. All of those are `log_e()` only, invisible at the default
+`CORE_DEBUG_LEVEL=0`. The observed symptom: the device jumps into the AP portal
+*immediately* after reset, with none of the usual 3–5 s connect lag, even though the router
+is up and the credentials are good.
+
+So `setup()` now does it the old, classic way first: if credentials are saved, a blocking
+`WiFi.begin()` + wait loop, retried (`WIFI_BOOT_ATTEMPTS` × `WIFI_BOOT_ATTEMPT_MS`,
+2 × 10 s), with the attempt counter on the LCD. **No other code runs until this window has
+passed.** Re-issuing `begin()` re-runs the whole STA bring-up, which is precisely the part
+that fails on the bad boots. Only after every attempt has failed is `wm.autoConnect()`
+allowed to fall through to the AP portal; when the loop has already connected,
+`autoConnect()` sees `WL_CONNECTED` and returns true without touching anything.
 
 ### WiFi supervision (`manageWiFi()`)
 
