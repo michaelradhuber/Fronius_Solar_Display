@@ -37,7 +37,7 @@
 #endif
 /* ---- END DEBUG SECTION ---- */
 
-#define TRIGGER_PIN 0   // BOOT button on the ESP32-S3
+#define TRIGGER_PIN 0   // BOOT button, on-board (same GPIO on the S3 and the WROOM-32)
 
 const char DEVICE_VERSION[]   = "1A";
 const char SOFTWARE_VERSION[] = "002_ALPHA";
@@ -132,10 +132,16 @@ Preferences preferences;
 NetScanner scanner;
 
 // LCD Wiring: RS, EN, D4, D5, D6, D7
-// Pinout for Waveshare ESP32-S3-ETH.
-// D6/D7 are on 47/48, NOT 19/20: those are the ESP32-S3 native USB pins
-// (USB_D-/USB_D+). Driving them from the LCD stops the board enumerating over USB.
-LiquidCrystal lcd(15, 16, 17, 18, 47, 48);
+// Pinout for the uPesy ESP-WROOM-32 DevKit. All six land on the left header, which
+// runs 33, 25, 26, 27, 14, 12, GND, 13 - so D7..D4 sit on four consecutive pads in
+// descending order and nothing has to cross the board.
+//
+// EN is on 33, NOT on 12 the way v1 had it. GPIO12 is MTDI: the ESP32 samples it at
+// reset to pick the flash core voltage, and held high it selects 1.8 V and the module
+// will not boot or flash. v1 survived because the HD44780's E input is high-impedance
+// and never pulled it up, but the pad sits in the middle of the run we are using, so
+// leave it bare.
+LiquidCrystal lcd(13, 33, 14, 27, 26, 25);
 
 /* ---- Custom LCD glyphs ---- */
 // The HD44780 has 8 CGRAM slots (0-7). Slots 0-3 hold the house and are set once

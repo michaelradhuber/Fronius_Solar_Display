@@ -3,14 +3,21 @@
 A 20×4 character LCD that shows live PV production, grid import/export and grid-voltage
 deviation, read from a Fronius inverter's **Solar API v1** over the local network.
 
-v2 is a port of the original `Fronius_Solar_Display` (ESP32 WROOM DA / DevKit V1) to the
-**Waveshare ESP32-S3-ETH**. The application logic is the same; the board change forced a
+v2 began as a port of the original `Fronius_Solar_Display` (ESP32 WROOM DA / DevKit V1) to
+the **Waveshare ESP32-S3-ETH**. The application logic is the same; the board change forced a
 new pinout, and a set of latent memory bugs were fixed along the way (see
 [Bugs fixed in the port](#bugs-fixed-in-the-port)).
 
+**That S3 board has since died and been replaced by a uPesy ESP-WROOM-32 DevKit** — back to
+v1's board family, and with it v1's pinout (one wire excepted). Everything below describes
+the WROOM-32; sections that only ever applied to the S3 are marked *retired*. All of the
+v2 work above the hardware layer — the memory fixes, the WiFi supervision, the ARP scanner —
+carried over untouched.
+
 **Pre-port source (v1):** `X:\Code\PlatformIO\Projects\Fronius_Solar_Display` — a separate
 git repo whose whole application lives in one file, `src/Display.cpp`. It is the reference
-for anything in this document that says "v1 did X".
+for anything in this document that says "v1 did X", and its `README.md` carries the wiring
+table and Fritzing sketch the current pinout is derived from.
 
 ---
 
@@ -18,34 +25,82 @@ for anything in this document that says "v1 did X".
 
 | | |
 |---|---|
-| **Board** | Waveshare ESP32-S3-ETH (ESP32-S3, 16 MB flash, 8 MB **octal** PSRAM) |
-| **Display** | HD44780-compatible 20×4 character LCD, 4-bit parallel mode |
-| **Network** | WiFi (STA). The board's W5500 Ethernet is **not used** — see [Ethernet](#ethernet-not-used) |
+| **Board** | uPesy ESP-WROOM-32 DevKit (ESP32-D0WD, 4 MB flash, no PSRAM) |
+| **Display** | HD44780-compatible 20×4 character LCD, 4-bit parallel mode, run at 5 V |
+| **Contrast** | B10K potentiometer: outer legs to 5 V / GND, wiper to LCD pin 3 (V0) |
+| **Network** | WiFi (STA) |
 | **Input** | The on-board **BOOT** button (GPIO0) |
 
 ### Pinout
 
 ```
-LCD (LiquidCrystal, 4-bit)      RS=15  EN=16  D4=17  D5=18  D6=47  D7=48
-Button                          GPIO0 (BOOT, INPUT_PULLUP)
+LCD (LiquidCrystal, 4-bit)      RS=13  EN=33  D4=14  D5=27  D6=26  D7=25
+LCD power                       VDD + backlight anode -> 5V ; VSS + RW + cathode -> GND
+Button                          GPIO0 (BOOT, INPUT_PULLUP, on-board — no wire)
 ```
+
+All eight connections land on the **left header**, which runs top to bottom:
+
+```
+3V3 EN 36 39 34 35 32  33  25  26  27  14  12  GND  13  9 10 11  5V
+                        E  D7  D6  D5  D4  ✗  rail  RS  ·  ·  ·  rail
+```
+
+So D7–D4 sit on four consecutive pads in descending order and no wire crosses the board.
+
+**`RW` (LCD pin 5) must be tied to GND.** The 6-argument `LiquidCrystal` constructor never
+drives RW, and grounding it pins the HD44780 in write-only mode — which is also what makes
+the 3.3 V / 5 V mix safe. The LCD's data pins stay inputs and never drive 5 V back into a
+non-5 V-tolerant GPIO. Leave RW floating and the display can drive the bus.
 
 **Pins you must not use on this board:**
 
 | GPIO | Why |
 |---|---|
-| **19, 20** | ESP32-S3 native USB (`USB_D−` / `USB_D+`). Driving these from the LCD **stops the board enumerating over USB** — no COM port, no flashing, no serial. This bit us: the original DevKit pinout put LCD D6/D7 here. |
-| **26–37** | Consumed by flash + octal PSRAM (`board_build.arduino.memory_type = qio_opi`). |
-| **9–14** | Wired to the on-board W5500 Ethernet controller. Free in practice since we don't use Ethernet, but leave them alone unless you enable it. |
-| **0, 3, 45, 46** | Strapping pins. GPIO0 is the BOOT button (fine as an input); avoid the others for driven outputs. |
-| **48** | Often the on-board WS2812 RGB LED. Used here for LCD D7 — worst case the LED flickers on LCD writes. |
+| **12** | **MTDI strapping pin — leave bare.** Sampled at reset to select the flash core voltage; held high it picks 1.8 V and the module will not boot or flash. v1 ran LCD EN here and survived (the HD44780's E input is high-impedance and never pulled it up), but the pad sits *inside* the run we use — between D4 and GND — so a miscount of one lands on it. EN was moved to 33. |
+| **6–11** | SPI flash. Never usable. |
+| **34–39** | Input only — cannot drive an LCD line. |
+| **0, 2, 15** | Strapping. GPIO0 is the BOOT button (fine as an input); avoid the others for driven outputs. |
+| **1, 3** | UART0 — the USB serial console. |
 
-Free and safe: `4–8, 15–18, 21, 38–44, 47`.
+Free and safe for driven outputs: `4, 5, 13, 14, 16–19, 21–23, 25–27, 32, 33`.
 
-### The antenna switch (0 R resistor)
+### Power — the display needs an external 5 V supply
 
-**This board ships wired to its on-board PCB antenna, and plugging an antenna into the IPEX
-connector does nothing until you move a 0 Ω resistor.** From the
+**USB power is not enough to run this build, and the way it fails looks like a wiring
+fault.** Confirmed empirically during the WROOM-32 rewire: identical firmware, identical
+soldering, blank or garbled LCD on USB, correct display the moment it ran from an external
+5 V supply.
+
+The load is the problem. A 20×4 module with its backlight is roughly 100–200 mA on its own,
+and the ESP32 adds ~300 mA bursts every time the radio transmits. Between the host port's
+current limit and the drop across the DevKit's protection diode, the 5 V rail sags under
+those bursts. Two consequences, and neither announces itself:
+
+- **Contrast is ratiometric.** V0 comes off a pot strung between 5 V and GND, so when VDD
+  droops the contrast bias droops with it and the panel goes unreadable — looking exactly
+  like a pot that needs adjusting.
+- **A brownout mid-write desynchronises the 4-bit bus.** The HD44780 takes commands as two
+  nibbles; interrupt it between them and every subsequent byte is shifted. The display then
+  shows stable, confident garbage until it is power-cycled.
+
+So: **USB for flashing and serial, external 5 V for running.** If the display misbehaves,
+rule out the supply before touching the wiring.
+
+> The same nibble-desync explains a symptom that is *not* a hardware fault: the HD44780 has
+> no reset line, so it does not restart when the ESP32 does. `LiquidCrystal::begin()` assumes
+> a controller that powered up in 8-bit mode, so re-running it against one already in 4-bit
+> mode can leave the bus out of sync. After any reset loop, **power-cycle the LCD** before
+> concluding anything about the wiring.
+
+### The antenna switch (0 R resistor) — *retired with the S3 board*
+
+Kept because the lesson generalises and [Radio tuning](#radio-tuning-tuneradio) refers back
+to it. The WROOM-32 has a fixed module antenna and no such switch — one less
+thing to get wrong.
+
+**The S3 board shipped wired to its on-board PCB antenna, and plugging an antenna into the
+IPEX connector did nothing until you moved a 0 Ω resistor.** From the
 [Waveshare wiki](docs/ESP32-S3-ETH%20-%20Waveshare%20Wiki.pdf) FAQ, *"How to switch to the
 external antenna for IPEX 1 generation"*:
 
@@ -80,25 +135,17 @@ Two traps, both of which we walked into:
 Correct configuration: horizontal bridge **only** (remove every trace of the vertical one),
 antenna clicked onto the **u.FL connector**, never soldered to the pads.
 
-### Ethernet (not used)
+### Ethernet — *retired with the S3 board*
 
-The board is an *ETH* variant, but the firmware is WiFi-only. The `Ethernet_Generic`
-dependency and the `W5500_SPI_*` build flags were removed: the library never read those
-macros (they configure nothing), two of the five pins were wrong anyway, and no code
-called `Ethernet` at all.
+The S3 board was an *ETH* variant with an on-board W5500; the firmware never used it, and
+the `Ethernet_Generic` dependency and `W5500_SPI_*` build flags were removed during the v2
+port (the library never read those macros, and two of the five pins were wrong anyway).
+The WROOM-32 has no Ethernet at all, so this is now moot.
 
-To enable it later, the W5500 sits on **SCK 13 / MISO 12 / MOSI 11 / CS 14 / INT 10 / RST 9**,
-and must be brought up explicitly:
-
-```cpp
-SPI.begin(13, 12, 11, 14);
-Ethernet.init(14);
-Ethernet.begin(mac);
-```
-
-Note `Ethernet_Generic`'s header is `Ethernet_Generic.h`, **not** `Ethernet.h`, and its
-`Dns_Impl.h` does `#define DNS_PORT 53`, which macro-clobbers WiFiManager's
-`const byte DNS_PORT` unless `WiFiManager.h` is included first.
+One landmine worth keeping if Ethernet ever comes back on any board: `Ethernet_Generic`'s
+header is `Ethernet_Generic.h`, **not** `Ethernet.h`, and its `Dns_Impl.h` does
+`#define DNS_PORT 53`, which macro-clobbers WiFiManager's `const byte DNS_PORT` unless
+`WiFiManager.h` is included first.
 
 ---
 
@@ -119,23 +166,74 @@ pio run -t upload
 pio device monitor -b 115200
 
 # Opt in to a network flash (board must already be running OTA firmware)
-pio run -e waveshare-esp32-s3-eth-ota -t upload
+pio run -e esp32-wroom-32-ota -t upload
 ```
-
-**Don't hardcode a COM port.** The ESP32-S3's native USB re-enumerates on every reset, and
-Windows can hand it a *different* COM number each time — a pinned `--upload-port COM4` will
-go stale on its own. `upload_port` is intentionally unset so PlatformIO auto-detects.
 
 `default_envs` pins the default to the USB env: a bare `pio run -t upload` will **not**
 try to flash over OTA. Without that, PlatformIO runs every env and the OTA upload fails
 with `Host solar-display.local Not Found`.
 
-No Windows driver is needed. The ESP32-S3's native USB enumerates as USB CDC
-(`usbser.sys`, inbox on Win10/11); in download mode it appears as a "USB JTAG/serial debug
-unit", also inbox. To force download mode: hold **BOOT**, tap **RESET**, release RESET,
-release BOOT.
+**The partition table is not the default, and must not go back to it.** `min_spiffs.csv`
+gives each OTA slot 1'966'080 B. The stock 4 MB layout gives 1'310'720 B, and this firmware
+is ~1'238'000 B — 94% full, with the overflow surfacing as a linker error that reads like a
+code problem. Nothing here uses SPIFFS/LittleFS, so the smaller data partition costs nothing.
 
-> If the board does *not* enumerate, suspect the LCD pinout before suspecting drivers.
+**COM port.** Unlike the S3's native USB, the DevKit's CP2102/CH340 bridge keeps a stable
+COM number across resets, so pinning `upload_port` is safe — it is just unnecessary, and
+`upload_port` is left unset so PlatformIO auto-detects. This board currently comes up on
+**COM5**.
+
+Unlike the S3, this board needs a **USB-serial driver** (CP210x or CH340, depending on which
+bridge the board carries) — it does not enumerate as inbox USB CDC.
+
+**Auto-reset into download mode does not work on this board.** `esptool` pulses DTR/RTS to
+drive EN and GPIO0 through the usual two-transistor circuit; here the EN half works and the
+GPIO0 half does not, so the chip resets and boots normally instead:
+
+```
+A fatal error occurred: Failed to connect to ESP32: Wrong boot mode detected (0x13)!
+```
+
+`0x13` is `SPI_FAST_FLASH_BOOT` — a normal boot, i.e. GPIO0 was never pulled low. **Hold the
+BOOT button down through the `Connecting......` dots** and release it once writing starts.
+Setting download mode by hand beforehand does *not* help on its own: esptool's own reset
+pulse knocks the chip straight back out of it before the sync.
+
+### Do not let a serial terminal assert DTR
+
+**On this board, opening the serial port with DTR asserted factory-resets the device.**
+
+DTR drives GPIO0 through the auto-reset circuit, so asserting it holds GPIO0 low.
+`checkButton()` reads that as the BOOT button, and after `LOW` for three seconds it calls
+`wm.resetSettings()` and `preferences.clear()` and reboots — wiping the WiFi credentials and
+the inverter IP/MAC. With DTR held, this repeats every ~8 s:
+
+```
+WIFI: Button Pressed
+WIFI: Button Held - erasing config, restarting
+*wm:SETTINGS ERASED
+rst:0xc (SW_CPU_RESET)
+```
+
+This bit us during the rewire and, because it also reset the ESP32 without resetting the
+LCD, it produced garbled output that read convincingly as a soldering fault.
+
+| Lines | Effect |
+|---|---|
+| DTR high, RTS low | GPIO0 **low** — the config-wipe trap |
+| DTR low, RTS high | EN low — clean reset, GPIO0 stays high |
+| Both low (or both high) | Idle — safe for passive monitoring |
+
+`pio device monitor` is safe. Raw `System.IO.Ports.SerialPort` is **not**: it defaults to
+`DtrEnable = false`, but any code that sets it true will wipe the device. To reset the board
+cleanly from a terminal, pulse RTS alone.
+
+This is worth guarding in firmware — ignore `TRIGGER_PIN` for the first few seconds after
+boot, or trigger on a press edge rather than a level — but it is not fixed yet.
+
+> The S3-era advice "if the board does not enumerate, suspect the LCD pinout" no longer
+> applies — that was specific to GPIO 19/20 being the S3's native USB lines. On the
+> WROOM-32 the USB bridge is independent of every pin the LCD touches.
 
 ### Building from the `X:` share
 
@@ -159,7 +257,7 @@ directly, which needs no project directory:
 ```bash
 python "$HOME/.platformio/packages/framework-arduinoespressif32/tools/espota.py" \
   -i solar-display.local -p 3232 -a changeme \
-  -f C:/pio-build/fronius-display-v2/waveshare-esp32-s3-eth/firmware.bin -r -d
+  -f C:/pio-build/fronius-display-v2/esp32-wroom-32/firmware.bin -r -d
 ```
 
 ---
@@ -282,7 +380,7 @@ Two supporting changes make this work:
 
 Written while the display was reading **-80 to -90 dBm** and the link was dropping constantly.
 That turned out to be a hardware fault, not a site problem — see
-[The antenna switch](#the-antenna-switch-0-r-resistor). Do not read this section as evidence
+[The antenna switch](#the-antenna-switch-0-r-resistor--retired-with-the-s3-board). Do not read this section as evidence
 that the installation is inherently marginal; **8 m of clear line-of-sight should read in the
 -40s**, and if it doesn't, fix the antenna before touching anything here.
 
