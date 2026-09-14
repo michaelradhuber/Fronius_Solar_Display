@@ -196,26 +196,33 @@ const char* NetScanner::findIP(const char* IP_ToFind){
     DEBUG_PRINTLN(ip4addr_ntoa(&test_ip));
     DEBUG_PRINT(F("IP4ADDR_ATON RETURNS: "));
     DEBUG_PRINTLN(retVal);
-    LOCK_TCPIP_CORE();
-    etharp_request(netif_interface, &test_ip);
-    UNLOCK_TCPIP_CORE();
 
-    vTaskDelay( xDelay ); //sleep for 0.5 seconds
+    // One request and one 500 ms look was not enough: a single lost frame at a weak
+    // RSSI, or a slow ARP reply, made a present inverter look absent - and the caller
+    // used to answer that by deleting the stored IP. Ask up to five times and return
+    // on the first hit.
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        LOCK_TCPIP_CORE();
+        etharp_request(netif_interface, &test_ip);
+        UNLOCK_TCPIP_CORE();
 
-    const ip4_addr_t *ipaddr_ret;
-    struct eth_addr *eth_ret = NULL;
-    LOCK_TCPIP_CORE();
-    s8_t found = etharp_find_addr(NULL, &test_ip, &eth_ret, &ipaddr_ret);
-    UNLOCK_TCPIP_CORE();
+        vTaskDelay( xDelay ); //sleep for 0.5 seconds
 
-    if(found >= 0){
-        DEBUG_PRINTLN(F("FOUND"));
-        return eth_ntoa(eth_ret);
-    } else {
-        DEBUG_PRINTLN(F("NOT FOUND"));
-        return NULL;
+        const ip4_addr_t *ipaddr_ret;
+        struct eth_addr *eth_ret = NULL;
+        struct eth_addr mac_copy;
+        LOCK_TCPIP_CORE();
+        s8_t found = etharp_find_addr(NULL, &test_ip, &eth_ret, &ipaddr_ret);
+        if (found >= 0) mac_copy = *eth_ret;  // the entry can be evicted once unlocked
+        UNLOCK_TCPIP_CORE();
+
+        if (found >= 0) {
+            DEBUG_PRINTF2("FOUND on ARP attempt %d\n", attempt);
+            return eth_ntoa(&mac_copy);
+        }
     }
-
+    DEBUG_PRINTLN(F("NOT FOUND after 5 ARP attempts"));
+    return NULL;
 }
 
 char* NetScanner::findIPbyMAC(const char* MAC_ToFind){

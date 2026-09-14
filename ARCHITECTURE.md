@@ -294,21 +294,23 @@ and most stages `return` so a single iteration does one thing.
        WL_CONNECTED? ── no ──► reconnect / AP portal, and do nothing else
               │ yes
               ▼
-      inverterIPSet?  ── no ──► open config portal, wait
+      inverterIPSet?  ── no ──► web portal; "Set inverter IP" held on the LCD, wait
               │ yes
               ▼
       inverterMACSet? ── no ──► resolveMAC()      ARP, non-blocking, retry 1s ×15 → 30s
               │ yes
               ▼
-      initSuccess?    ── no ──► runInverterHandshake()
-              │ yes                 ├─ netscanner: is IP_char still our MAC?
-              │                     │    ├─ no  → re-find by MAC → save → reboot
-              │                     │    └─ gone → clear IP → reboot
-              │                     └─ GET /solar_api/GetAPIVersion.cgi → must be 1
+      initSuccess?    ── no ──► runInverterHandshake()      one attempt per call
+              │ yes                 ├─ ARP IP_char (5 tries): still our MAC?
+              │                     │    └─ no → MAC sweep (≤ every 30 min) → found? save IP
+              │                     ├─ GET /solar_api/GetAPIVersion.cgi → must be 1
+              │                     └─ any failure → "Inverter unavailable" on the LCD,
+              │                          retry after 30 s, doubling to 5 min.
+              │                          Never deletes the stored IP/MAC, never reboots.
               ▼
     ┌────────────────────────┐
     │ POLL every 5s          │  getInverterData()  + getGridVoltage()
-    │  → drawPowerScreen()   │  >5 consecutive errors → reboot
+    │  → drawPowerScreen()   │  >5 errors → back to handshake retries (no reboot)
     └────────────────────────┘  errors forgotten after 5 min
 ```
 
@@ -359,7 +361,7 @@ power-cycled it.
 | **Falling edge** (link dropped) | Note the time, tell the user, stop polling |
 | **Offline, no portal** | `WiFi.begin()` (saved NVS creds) every **20 s** |
 | **Offline > 2 min** | Raise the AP portal so the user *can* re-provision — without giving up on the saved network |
-| **AP portal idle > 3 min** | Take it down, switch the station back on, retry the saved credentials. If the router is still gone, the 2-minute timer raises the AP again |
+| **AP portal idle > 15 min** | Take it down, switch the station back on, retry the saved credentials. If the router is still gone, the 2-minute timer raises the AP again. The station is off while the AP is up, so a router that returns mid-portal is only noticed once the 15 minutes run out |
 | **AP portal, client connected** | Leave it up. `WiFi.softAPgetStationNum() > 0` keeps pushing the deadline out, so it never dies under someone who is mid-configuration |
 | **AP portal, no saved SSID** | Leave it up forever. A fresh device has nothing to fall back to |
 
@@ -415,24 +417,54 @@ matter most.
 |---|---|---|
 | `inverter_IP` | string | Inverter's IPv4, entered by the user in the portal |
 | `inverter_MAC` | string | Resolved via ARP. The **stable identity** — IPs move, MACs don't |
-| `inverterIPSet` | bool | Gate for the portal |
+| `inverterIPSet` | bool | Set by the user in the portal. **Never cleared by a failed lookup** — see below |
 | `inverterMACSet` | bool | Gate for `resolveMAC()` |
 
 WiFi credentials are stored separately by WiFiManager.
 
 ### Why the MAC matters
 
-The inverter is found by **IP**, but identified by **MAC**. On every boot
-`runInverterHandshake()` ARPs `inverter_IP` and compares the answer to the stored MAC:
+The inverter is found by **IP**, but identified by **MAC**. `runInverterHandshake()` ARPs
+`inverter_IP` — up to five requests, 500 ms apart — and compares the answer to the stored MAC:
 
-- **Match** → proceed.
-- **Different MAC** → some *other* host now holds that IP. Clear `inverterIPSet`, reboot.
-- **No answer** → the inverter's DHCP lease moved. `netscanner.findIPbyMAC()` sweeps the
-  /24 with ARP requests, finds the new IP, saves it, reboots.
+- **Match** → check the API version, start polling.
+- **No answer, or a different MAC** → the lease may have moved. `netscanner.findIPbyMAC()`
+  sweeps the /24; if the MAC turns up at a new address, that IP is saved and the handshake
+  carries on without a reboot.
+- **Still not found** → the inverter is *unavailable*, not *misconfigured*. The LCD says so,
+  and the handshake retries after 30 s, doubling to 5 min.
 
 This is what makes the display survive a DHCP reshuffle without the user touching it.
-The sweep is slow by design (254 addresses × 500 ms ≈ **2 minutes**) — hence the
-"please be patient" screen.
+The sweep is slow (254 addresses × 500 ms ≈ **2 minutes**, blocking `loop()`), so it runs at
+most every 30 minutes; the cheap single-IP check runs on every retry.
+
+### The inverter disappears every night — never delete its address
+
+**Nothing in the handshake or the poll loop deletes `inverter_IP` / `inverter_MAC`, or
+reboots, because the inverter did not answer.** Only the user changes the address, in the
+portal.
+
+Until September 2026 both happened, and together they stranded the display:
+
+1. The inverter stops answering. Fronius Datamanagers switch off at night unless **Night
+   Mode** is enabled; a single lost ARP reply at a weak RSSI has the same effect.
+2. More than five failed polls → `ESP.restart()`.
+3. The boot handshake runs while the inverter is still silent: no ARP answer, MAC not found
+   by the sweep → `inverterIPSet = false` written to NVS → reboot.
+4. From then on `loop()` has no IP and does nothing. Its only prompt, "Set inverter IP", was
+   painted once, when the web portal opened; the next WiFi reconnect painted
+   `WIFI: connected / <ip>` over it, and that stayed on screen until someone re-entered the IP.
+
+It looked exactly like a firmware hang, and wasn't one. v1 had the same intent but a broken
+wipe (`putString("inverter_IP", 0)`); the v2 port fixed the wipe and so made it *work*.
+
+Now: failed handshakes keep the stored address and retry with backoff; failed polls drop back
+to the handshake instead of rebooting; and `loop()` re-claims the LCD for the two screens that
+describe a waiting state ("Set inverter IP", "Inverter unavailable") whenever something else
+has painted over them.
+
+Closed on the way: the handshake read an unreachable API as `APIVersion 0` — `httpGETRequest()`
+returns `"{}"` on failure, which parses cleanly — and rebooted with "API version not supported".
 
 ---
 
@@ -448,7 +480,7 @@ Reference documents, both in [docs/](docs/):
 
 | Endpoint | Used for |
 |---|---|
-| `/solar_api/GetAPIVersion.cgi` | Handshake. `APIVersion` must be `1`, else reboot. |
+| `/solar_api/GetAPIVersion.cgi` | Handshake. `APIVersion` must be `1`; anything else — including no reply — shows "Inverter unavailable" and retries. |
 | `/solar_api/v1/GetPowerFlowRealtimeData.fcgi` | PV production, grid flow |
 | `/solar_api/v1/GetMeterRealtimeData.cgi?Scope=System` | Per-phase grid voltage |
 

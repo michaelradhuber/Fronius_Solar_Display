@@ -82,7 +82,9 @@ static const uint8_t  ARP_FAST_ATTEMPTS = 15;
 // and startConfigPortal() actively turns the station interface OFF. So we drive it.
 static const uint32_t WIFI_RETRY_MS     = 20000;   // between reconnect attempts
 static const uint32_t WIFI_GRACE_MS     = 120000;  // offline this long -> raise the AP
-static const uint32_t AP_PORTAL_MAX_MS  = 180000;  // ...then drop it and retry the STA
+// 15 min: long enough to walk over with a phone and reconfigure. AP mode switches the
+// station off, so the router is not retried at all while the portal is up.
+static const uint32_t AP_PORTAL_MAX_MS  = 900000;  // ...then drop it and retry the STA
 
 // Boot connect: classic blocking begin-and-wait, retried, BEFORE WiFiManager runs.
 // wm.autoConnect() makes exactly one attempt with no timeout and no retries
@@ -91,6 +93,16 @@ static const uint32_t AP_PORTAL_MAX_MS  = 180000;  // ...then drop it and retry 
 // straight into the AP portal without ever having tried the router.
 static const uint8_t  WIFI_BOOT_ATTEMPTS   = 2;      // 2 x 10 s = max 20 s before letting go
 static const uint32_t WIFI_BOOT_ATTEMPT_MS = 10000;  // per-attempt connect window
+
+// Inverter handshake retries. The inverter going quiet is normal - Fronius Datamanagers
+// switch off at night unless Night Mode is enabled - so a failed handshake is retried
+// with backoff. It never deletes the stored IP/MAC and never reboots: together those
+// turned one night of a sleeping inverter into a device waiting for the user forever.
+static const uint32_t HANDSHAKE_RETRY_MIN_MS = 30000;    // first retry after 30 s...
+static const uint32_t HANDSHAKE_RETRY_MAX_MS = 300000;   // ...doubling up to 5 min
+// Re-finding the inverter by MAC ARPs the whole /24 and blocks loop() for ~2 min
+// (254 requests x 0.5 s), so it is rationed. The cheap single-IP check runs every retry.
+static const uint32_t MAC_SWEEP_INTERVAL_MS  = 1800000;  // at most every 30 min
 
 char IP_char[IP_LEN]   = "";
 char MAC_char[MAC_LEN] = "";
@@ -123,6 +135,18 @@ bool     haveSavedWiFi    = false;  // are there credentials to fall back on?
 uint32_t offlineSince     = 0;      // millis() of the drop, 0 while online
 uint32_t lastWifiRetry    = 0;
 uint32_t apPortalStarted  = 0;      // millis() the soft-AP portal was raised
+
+uint32_t lastHandshakeAttempt = 0;   // millis() of the last try, 0 = none pending
+uint32_t handshakeBackoff     = HANDSHAKE_RETRY_MIN_MS;
+uint32_t lastMacSweep         = 0;   // millis() of the last /24 sweep, 0 = none yet
+const char *inverterProblem   = "";  // why the handshake failed, shown on the LCD
+
+// Screens that must stay up until the state behind them changes. Every other paint
+// (lcdMessage, the power screen, an HTTP error) marks the LCD Other, and loop()
+// repaints the one that belongs there. Without this a WiFi reconnect message covered
+// "Set inverter IP" and stayed on screen indefinitely.
+enum class LcdScreen : uint8_t { Other, IpPrompt, InverterOffline };
+LcdScreen onScreen = LcdScreen::Other;
 
 WiFiManager wm;
 WiFiManagerParameter inverter_input;
@@ -177,6 +201,8 @@ PowerData getInverterData();
 GridVoltage getGridVoltage();
 void lcdMessage(const char *l0, const char *l1 = nullptr,
                 const char *l2 = nullptr, const char *l3 = nullptr);
+void showIPPrompt();
+void showInverterOffline();
 
 void setup() {
 #ifdef DEBUG
@@ -348,24 +374,39 @@ void loop() {
   // failures rebooted the device straight into the AP portal.
   if (WiFi.status() != WL_CONNECTED) return;
 
-  if (inverterIPSet && !inverterMACSet) {
+  // No inverter IP: nothing below can run until one is entered in the web portal, so
+  // keep that request on the LCD. openPortal() used to paint it once, when the portal
+  // started, and the next message - a WiFi reconnect - buried it for good.
+  if (!inverterIPSet) {
+    if (onScreen != LcdScreen::IpPrompt) showIPPrompt();
+    return;
+  }
+
+  if (!inverterMACSet) {
     resolveMAC();
     return;
   }
 
-  // One-time handshake: confirm the box at IP_char is still our inverter, and
-  // that it speaks Solar API v1.
-  if (inverterIPSet && inverterMACSet && !initSuccess) {
+  // Handshake: confirm the box at IP_char is still our inverter, and that it speaks
+  // Solar API v1. Retried with backoff until it succeeds - see runInverterHandshake().
+  if (!initSuccess) {
     runInverterHandshake();
     return;
   }
 
-  // Reboot if the inverter has been unreachable too many times in a row.
+  // The inverter stopped answering. Rebooting cannot wake it, and used to re-run the
+  // handshake at exactly the moment it would fail and delete the stored IP. Drop back
+  // to the handshake instead, which retries with backoff and owns the LCD meanwhile.
   if (connectErrors > MAX_CONNECT_ERRORS) {
-    DEBUG_PRINTLN(F("Too many connection errors, rebooting..."));
-    lcdMessage("Too many errors,", "rebooting...");
-    delay(2000);
-    ESP.restart();
+    DEBUG_PRINTLN(F("Inverter stopped responding, back to handshake retries"));
+    initSuccess          = false;
+    connectErrors        = 0;
+    errorTimeout         = 0;
+    inverterProblem      = "stopped responding";
+    lastHandshakeAttempt = millis();  // first retry after HANDSHAKE_RETRY_MIN_MS
+    handshakeBackoff     = HANDSHAKE_RETRY_MIN_MS;
+    showInverterOffline();
+    return;
   }
   if (errorTimeout != 0 && (millis() - errorTimeout) > ERROR_RESET_MS) {
     connectErrors = 0;
@@ -384,6 +425,7 @@ void loop() {
 /* ---- Display ---- */
 
 void lcdMessage(const char *l0, const char *l1, const char *l2, const char *l3) {
+  onScreen = LcdScreen::Other;
   lcd.clear();
   const char *lines[4] = {l0, l1, l2, l3};
   for (int i = 0; i < 4; i++) {
@@ -391,6 +433,17 @@ void lcdMessage(const char *l0, const char *l1, const char *l2, const char *l3) 
     lcd.setCursor(0, i);
     lcd.print(lines[i]);
   }
+}
+
+// Both paint through lcdMessage() - which marks the LCD Other - and then claim it.
+void showIPPrompt() {
+  lcdMessage("Set inverter IP at", WiFi.localIP().toString().c_str());
+  onScreen = LcdScreen::IpPrompt;
+}
+
+void showInverterOffline() {
+  lcdMessage("Inverter unavailable", IP_char, inverterProblem, "retrying...");
+  onScreen = LcdScreen::InverterOffline;
 }
 
 // Formats watts as "1234W" or "12.3kW" into buf.
@@ -404,6 +457,7 @@ static void formatPower(int watts, char *buf, size_t len) {
 }
 
 void drawPowerScreen(const PowerData &prm, const GridVoltage &gv) {
+  onScreen = LcdScreen::Other;
   lcd.clear();
 
   // PV production (row 0)
@@ -484,6 +538,7 @@ String httpGETRequest(const char *serverPath) {
     payload = http.getString();
   } else {
     DEBUG_PRINTF("HTTP error code: %d\n", httpResponseCode);
+    onScreen = LcdScreen::Other;
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print(F("HTTP Error: "));
@@ -618,82 +673,99 @@ GridVoltage getGridVoltage() {
 
 /* ---- Inverter discovery / handshake ---- */
 
-// Confirms the box at IP_char is still the inverter we recorded, and that it
-// speaks Solar API v1. If its DHCP lease moved, re-find it by MAC.
+// Confirms the box at IP_char is still the inverter we recorded, and that it speaks
+// Solar API v1. If its DHCP lease moved, re-finds it by MAC.
+//
+// One attempt per call; loop() keeps calling until initSuccess. Every failure is
+// treated as temporary: the stored IP/MAC are kept and the attempt is retried with
+// backoff. Only the user, through the portal, changes the inverter address.
+static void handshakeFailed(const char *reason) {
+  inverterProblem = reason;
+  DEBUG_PRINTF("Handshake failed (%s), next try in %lu s\n", reason,
+               (unsigned long)(handshakeBackoff / 1000));
+  showInverterOffline();
+}
+
 void runInverterHandshake() {
-  lcdMessage("Scanning network...", "Please wait, this", "might take a bit...");
+  if (lastHandshakeAttempt != 0) {
+    if ((millis() - lastHandshakeAttempt) < handshakeBackoff) {
+      // Waiting out the backoff. Reclaim the LCD if something else painted over it.
+      if (onScreen != LcdScreen::InverterOffline) showInverterOffline();
+      return;
+    }
+    handshakeBackoff = min(handshakeBackoff * 2, HANDSHAKE_RETRY_MAX_MS);
+  }
+  lastHandshakeAttempt = millis();
+
+  lcdMessage("Checking inverter at", IP_char, "Please wait...");
 
   scanner.begin();
-  const char *eth_ret = scanner.findIP(IP_char);
-
-  if (eth_ret == nullptr) {
-    // IP no longer answers - the inverter probably got a new DHCP lease.
-    scanner.end();
-    scanner.begin();
-    DEBUG_PRINTLN(F("IP not found in ARP table"));
-    lcdMessage("Inverter IP changed", "searching by MAC.", "please be patient...");
-
-    char *IPResult = scanner.findIPbyMAC(MAC_char);
-    if (IPResult != nullptr && isValidIP(IPResult)) {
-      DEBUG_PRINTF("Resolved new IP: %s\n", IPResult);
-      strlcpy(IP_char, IPResult, sizeof(IP_char));
-      preferences.putString("inverter_IP", IP_char);
-      lcdMessage("Inverter IP changed", "New IP found:", IP_char, "rebooting...");
-    } else {
-      DEBUG_PRINTLN(F("Could not find inverter by MAC"));
-      // v1 passed a literal 0 to putString() here - that is a const char* nullptr.
-      // Clear the flag instead so the portal reopens after the reboot.
-      preferences.putBool("inverterIPSet", false);
-      lcdMessage("Inverter not found", "on the network.", "rebooting...");
-    }
-    scanner.end();
-    delay(2000);
-    ESP.restart();
-  }
-
-  DEBUG_PRINTLN(F("IP found in ARP table"));
-  DEBUG_PRINTF("Comparing current MAC %s with stored MAC %s\n", eth_ret, MAC_char);
-  bool macMatches = (strcmp(MAC_char, eth_ret) == 0);
+  const char *foundMac = scanner.findIP(IP_char);
+  bool isOurs = (foundMac != nullptr && strcmp(MAC_char, foundMac) == 0);
+  DEBUG_PRINTF("ARP at %s: %s (stored MAC %s)\n", IP_char,
+               foundMac ? foundMac : "no answer", MAC_char);
   scanner.end();
-  delay(500);  // give the destructor time to clean up
 
-  if (!macMatches) {
-    // Something else now holds that IP.
-    DEBUG_PRINTLN(F("MAC address does not match"));
-    preferences.putBool("inverterIPSet", false);
-    lcdMessage("MAC address does", "not match,", "rebooting...");
-    delay(2000);
-    ESP.restart();
+  if (!isOurs) {
+    // Nothing answers at IP_char (inverter asleep, or its lease moved), or another host
+    // holds the address now. Only a sweep for the MAC tells those apart, and it is
+    // rationed because it blocks for ~2 min. Neither outcome deletes anything.
+    if (lastMacSweep == 0 || (millis() - lastMacSweep) >= MAC_SWEEP_INTERVAL_MS) {
+      lastMacSweep = millis();
+      lcdMessage("Inverter not at", IP_char, "searching by MAC,", "takes ~2 minutes...");
+
+      char newIP[IP_LEN] = "";
+      scanner.begin();
+      const char *byMac = scanner.findIPbyMAC(MAC_char);
+      if (byMac != nullptr && isValidIP(byMac)) strlcpy(newIP, byMac, sizeof(newIP));
+      scanner.end();  // frees the table byMac points into - copied above
+
+      if (newIP[0] != '\0') {
+        DEBUG_PRINTF("Inverter found by MAC at new IP %s\n", newIP);
+        strlcpy(IP_char, newIP, sizeof(IP_char));
+        preferences.putString("inverter_IP", IP_char);
+        inverter_input.setValue(IP_char, IP_LEN - 1);  // the portal shows the new address
+        isOurs = true;
+      }
+    }
+    if (!isOurs) {
+      handshakeFailed(foundMac == nullptr ? "not found on network" : "other device at IP");
+      return;
+    }
   }
 
   char url[URL_LEN];
-  if (!buildURL(url, sizeof(url), APIDATA)) return;
+  if (!buildURL(url, sizeof(url), APIDATA)) {
+    handshakeFailed("URL too long");
+    return;
+  }
 
-  delay(500);
   String payload = httpGETRequest(url);
-  delay(500);
 
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    DEBUG_PRINTF("deserializeJson() failed: %s\n", error.f_str());
-    noteConnectError();
-    return;  // retried next loop
+  // httpGETRequest() returns "{}" on failure, which parses cleanly - so an unreachable
+  // API used to fall through to APIVersion 0, "not supported", and a reboot.
+  if (error || doc["APIVersion"].isNull()) {
+    DEBUG_PRINTF("No usable API version reply (%s)\n", error ? error.c_str() : "missing");
+    handshakeFailed("no Solar API reply");
+    return;
   }
 
   int APIVersion = doc["APIVersion"].as<int>();
   DEBUG_PRINTF("API Version: %d\n", APIVersion);
-
   if (APIVersion != 1) {
-    DEBUG_PRINTLN(F("API Version not supported"));
-    lcdMessage("API Version not", "supported,", "rebooting...");
-    delay(2000);
-    ESP.restart();
+    // A real incompatibility - but rebooting cannot fix that either. Keep saying so.
+    handshakeFailed("API version not v1");
+    return;
   }
 
   lcdMessage("API Version: 1", "...loading data....");
-  initSuccess = true;
-  pollTimeout = millis() - POLL_INTERVAL_MS;  // poll immediately
+  initSuccess          = true;
+  lastHandshakeAttempt = 0;
+  handshakeBackoff     = HANDSHAKE_RETRY_MIN_MS;
+  inverterProblem      = "";
+  pollTimeout          = millis() - POLL_INTERVAL_MS;  // poll immediately
 }
 
 /* ---- OTA ---- */
@@ -836,12 +908,8 @@ void openPortal() {
   if (WiFi.status() == WL_CONNECTED) {
     wm.startWebPortal();
     DEBUG_PRINTF("Web portal: http://%s/\n", WiFi.localIP().toString().c_str());
-    // Only claim the LCD while the inverter IP is still missing - once it is set
-    // the portal is just sitting there for later edits, and the power screen owns
-    // the display.
-    if (!inverterIPSet) {
-      lcdMessage("Set inverter IP at", WiFi.localIP().toString().c_str());
-    }
+    // No LCD message here: loop() keeps "Set inverter IP" on screen for as long as
+    // the IP is missing, not just at the moment the portal opens.
   } else {
     openAPPortal();
   }
@@ -1003,6 +1071,10 @@ void saveParamCallback() {
   inverterMACSet = false;
   preferences.putBool("inverterMACSet", false);
   initSuccess = false;
+  // A fresh address deserves an immediate attempt, not the tail of an old backoff.
+  lastHandshakeAttempt = 0;
+  handshakeBackoff     = HANDSHAKE_RETRY_MIN_MS;
+  lastMacSweep         = 0;
 
   // Leave the portal up. It used to be torn down here, which - on the soft-AP
   // portal - killed it before WiFi credentials had been saved, stranding the
